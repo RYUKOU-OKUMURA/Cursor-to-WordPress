@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import sys
+from datetime import datetime, date
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
@@ -282,6 +283,63 @@ def parse_front_matter(content: str) -> Tuple[Dict[str, Any], str]:
         logger.debug("Front Matterは検出されませんでした")
     
     return metadata, body
+
+
+def normalize_date_for_wp(value: Any) -> Optional[str]:
+    """
+    Front Matterの日時をWordPress向けの形式に正規化する。
+    
+    Args:
+        value: Front Matterで指定された日時
+    
+    Returns:
+        Optional[str]: 正規化済みの日時文字列（ISO 8601 など）
+    """
+    if value is None:
+        return None
+    
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0).isoformat()
+    
+    if isinstance(value, date):
+        return value.isoformat()
+    
+    value_str = str(value).strip()
+    return value_str if value_str else None
+
+
+def remove_heading_matching_title(content: str, title: str) -> str:
+    """
+    本文内のH1/H2がタイトルと一致する場合にその行を除去する。
+    
+    Args:
+        content: 本文
+        title: タイトル文字列
+    
+    Returns:
+        str: タイトル見出しを除去した本文
+    """
+    if not title:
+        return content
+    
+    lines = content.split('\n')
+    title_line_index = None
+    heading_pattern = re.compile(r'^(#{1,2})\s+(.+)$')
+    
+    for i, line in enumerate(lines):
+        match = heading_pattern.match(line.strip())
+        if match and match.group(2).strip() == title:
+            title_line_index = i
+            break
+    
+    if title_line_index is None:
+        return content
+    
+    new_lines = lines[:title_line_index] + lines[title_line_index + 1:]
+    while new_lines and new_lines[0].strip() == '':
+        new_lines.pop(0)
+    
+    return '\n'.join(new_lines)
 
 
 # =============================================================================
@@ -700,6 +758,54 @@ def is_supported_image_format(file_path: str) -> bool:
     return ext in supported_extensions
 
 
+def find_existing_media(
+    config: dict,
+    file_name: str
+) -> Optional[Dict[str, Any]]:
+    """
+    既存のメディアから同名ファイルを検索する。
+    
+    Args:
+        config: 設定辞書
+        file_name: 画像ファイル名
+    
+    Returns:
+        Optional[Dict[str, Any]]: 見つかった場合は {'id': ID, 'url': URL, 'filename': file_name}
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/media"
+    
+    try:
+        response = requests.get(
+            endpoint,
+            params={'search': file_name, 'per_page': 100},
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            logger.debug(f"メディア検索失敗 [{response.status_code}]")
+            return None
+        
+        file_name_lower = file_name.lower()
+        
+        for item in response.json():
+            source_url = item.get('source_url') or ''
+            media_file = (item.get('media_details') or {}).get('file') or ''
+            
+            if source_url.lower().endswith(file_name_lower) or media_file.lower().endswith(file_name_lower):
+                return {
+                    'id': item.get('id'),
+                    'url': source_url,
+                    'filename': file_name
+                }
+        
+        return None
+        
+    except requests.exceptions.RequestException as e:
+        logger.debug(f"メディア検索中にエラー: {e}")
+        return None
+
+
 # =============================================================================
 # Phase 3-2: メディアアップロード
 # =============================================================================
@@ -741,11 +847,17 @@ def upload_image(
     logger.debug(f"画像アップロード開始: {path.name} (MIME: {mime_type})")
     
     try:
-        with open(image_path, 'rb') as f:
-            file_data = f.read()
-        
         # ファイル名（日本語対応）
         file_name = path.name
+        
+        # 既存メディアの重複チェック
+        existing = find_existing_media(config, file_name)
+        if existing:
+            logger.info(f"既存画像を再利用: {file_name} (ID: {existing['id']})")
+            return existing
+        
+        with open(image_path, 'rb') as f:
+            file_data = f.read()
         
         # リクエストヘッダー
         headers = {
@@ -1328,6 +1440,7 @@ def main():
         if 'title' in metadata:
             title = metadata['title']
             # タイトルが指定されている場合は本文からの抽出はスキップ
+            body = remove_heading_matching_title(body, title)
             logger.info(f"タイトル (Front Matter): {title}")
         else:
             # 本文からタイトルを抽出
@@ -1365,7 +1478,7 @@ def main():
     
     # その他のメタデータ
     slug = metadata.get('slug')
-    date = metadata.get('date')
+    date = normalize_date_for_wp(metadata.get('date'))
     excerpt = metadata.get('excerpt')
     
     if slug:
@@ -1430,7 +1543,7 @@ def main():
         categories=category_ids,
         tags=tag_ids,
         slug=slug,
-        date=str(date) if date else None,
+        date=date,
         excerpt=excerpt,
         featured_media=featured_media_id
     )

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, date
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -21,6 +22,8 @@ from post_to_wp import (
     move_jsonld_to_end,
     is_html_file,
     is_markdown_file,
+    normalize_date_for_wp,
+    remove_heading_matching_title,
 )
 
 
@@ -316,6 +319,51 @@ class TestMoveJsonldToEnd(unittest.TestCase):
         # 両方のJSON-LDが含まれる
         self.assertIn('Article', result)
         self.assertIn('Organization', result)
+
+
+class TestNormalizeDateForWp(unittest.TestCase):
+    """normalize_date_for_wp() 関数のテスト"""
+
+    def test_normalize_datetime(self):
+        """datetimeをISO 8601に変換"""
+        value = datetime(2024, 1, 15, 12, 30, 5, 123456)
+        self.assertEqual(normalize_date_for_wp(value), "2024-01-15T12:30:05")
+
+    def test_normalize_date(self):
+        """dateをISO形式に変換"""
+        value = date(2024, 1, 15)
+        self.assertEqual(normalize_date_for_wp(value), "2024-01-15")
+
+    def test_normalize_string(self):
+        """文字列はそのまま返す"""
+        value = "2024-01-15T12:00:00"
+        self.assertEqual(normalize_date_for_wp(value), value)
+
+    def test_normalize_none(self):
+        """NoneはNoneのまま"""
+        self.assertIsNone(normalize_date_for_wp(None))
+
+
+class TestRemoveHeadingMatchingTitle(unittest.TestCase):
+    """remove_heading_matching_title() 関数のテスト"""
+
+    def test_remove_h1_matching_title(self):
+        """H1がタイトルと一致する場合に除去"""
+        content = "# タイトル\n\n本文"
+        result = remove_heading_matching_title(content, "タイトル")
+        self.assertEqual(result.strip(), "本文")
+
+    def test_remove_h2_matching_title(self):
+        """H2がタイトルと一致する場合に除去"""
+        content = "## タイトル\n\n本文"
+        result = remove_heading_matching_title(content, "タイトル")
+        self.assertEqual(result.strip(), "本文")
+
+    def test_no_change_when_not_matching(self):
+        """タイトルが一致しない場合は変更しない"""
+        content = "# 別タイトル\n\n本文"
+        result = remove_heading_matching_title(content, "タイトル")
+        self.assertEqual(result, content)
 
 
 class TestFileTypeDetection(unittest.TestCase):
