@@ -7,6 +7,7 @@ MarkdownファイルをWordPressに投稿するCLIツール。
 
 import argparse
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -18,6 +19,10 @@ import requests
 import yaml
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+
+
+# MIMEタイプの初期化
+mimetypes.init()
 
 
 # =============================================================================
@@ -536,6 +541,399 @@ def move_jsonld_to_end(html_content: str) -> str:
 
 
 # =============================================================================
+# Phase 3-1: ローカル画像検出
+# =============================================================================
+
+def find_local_images(content: str, base_path: str) -> List[Dict[str, str]]:
+    """
+    Markdown/HTMLコンテンツからローカル画像を検出する。
+    
+    検出パターン:
+    - Markdown: ![alt](path)
+    - HTML: <img src="path">
+    
+    外部URL（http://, https://）は除外する。
+    
+    Args:
+        content: Markdown/HTMLコンテンツ
+        base_path: 画像パスの基準となるファイルパス
+    
+    Returns:
+        List[Dict[str, str]]: 画像情報のリスト
+        各要素は {'original': 元のパス, 'absolute': 絶対パス, 'alt': alt属性} を含む
+    """
+    images = []
+    base_dir = Path(base_path).parent
+    
+    # Markdownの画像パターン: ![alt](path) または ![alt](path "title")
+    md_pattern = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+    
+    # HTMLの画像パターン: <img ... src="path" ...>
+    html_pattern = re.compile(
+        r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
+        re.IGNORECASE
+    )
+    
+    # alt属性を抽出するパターン
+    alt_pattern = re.compile(r'alt=["\']([^"\']*)["\']', re.IGNORECASE)
+    
+    # Markdownパターンで検索
+    for match in md_pattern.finditer(content):
+        alt_text = match.group(1)
+        image_path = match.group(2)
+        
+        # 外部URLは除外
+        if image_path.startswith(('http://', 'https://', '//')):
+            logger.debug(f"外部URL画像をスキップ: {image_path}")
+            continue
+        
+        # データURIは除外
+        if image_path.startswith('data:'):
+            logger.debug(f"データURI画像をスキップ")
+            continue
+        
+        # 絶対パスまたは相対パスを解決
+        if os.path.isabs(image_path):
+            absolute_path = Path(image_path)
+        else:
+            absolute_path = (base_dir / image_path).resolve()
+        
+        # ファイルが存在するかチェック
+        if absolute_path.exists() and absolute_path.is_file():
+            images.append({
+                'original': image_path,
+                'absolute': str(absolute_path),
+                'alt': alt_text or absolute_path.stem,
+                'match': match.group(0)  # マッチした全体の文字列
+            })
+            logger.debug(f"ローカル画像を検出: {image_path} -> {absolute_path}")
+        else:
+            logger.warning(f"画像ファイルが見つかりません: {image_path} (解決先: {absolute_path})")
+    
+    # HTMLパターンで検索
+    for match in html_pattern.finditer(content):
+        image_path = match.group(1)
+        full_tag = match.group(0)
+        
+        # 外部URLは除外
+        if image_path.startswith(('http://', 'https://', '//')):
+            logger.debug(f"外部URL画像をスキップ: {image_path}")
+            continue
+        
+        # データURIは除外
+        if image_path.startswith('data:'):
+            logger.debug(f"データURI画像をスキップ")
+            continue
+        
+        # すでにMarkdownパターンで検出済みかチェック（重複回避）
+        if any(img['original'] == image_path for img in images):
+            continue
+        
+        # alt属性を抽出
+        alt_match = alt_pattern.search(full_tag)
+        alt_text = alt_match.group(1) if alt_match else ''
+        
+        # 絶対パスまたは相対パスを解決
+        if os.path.isabs(image_path):
+            absolute_path = Path(image_path)
+        else:
+            absolute_path = (base_dir / image_path).resolve()
+        
+        # ファイルが存在するかチェック
+        if absolute_path.exists() and absolute_path.is_file():
+            images.append({
+                'original': image_path,
+                'absolute': str(absolute_path),
+                'alt': alt_text or absolute_path.stem,
+                'match': full_tag
+            })
+            logger.debug(f"ローカル画像を検出 (HTML): {image_path} -> {absolute_path}")
+        else:
+            logger.warning(f"画像ファイルが見つかりません: {image_path} (解決先: {absolute_path})")
+    
+    logger.info(f"ローカル画像を {len(images)} 件検出しました")
+    return images
+
+
+def get_mime_type(file_path: str) -> str:
+    """
+    ファイルのMIMEタイプを取得する。
+    
+    Args:
+        file_path: ファイルパス
+    
+    Returns:
+        str: MIMEタイプ
+    """
+    mime_type, _ = mimetypes.guess_type(file_path)
+    
+    if mime_type is None:
+        # 拡張子から推測
+        ext = Path(file_path).suffix.lower()
+        mime_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.svg': 'image/svg+xml',
+            '.bmp': 'image/bmp',
+            '.ico': 'image/x-icon',
+        }
+        mime_type = mime_map.get(ext, 'application/octet-stream')
+    
+    return mime_type
+
+
+def is_supported_image_format(file_path: str) -> bool:
+    """
+    サポートされている画像形式かどうかを判定する。
+    
+    Args:
+        file_path: ファイルパス
+    
+    Returns:
+        bool: サポートされている場合はTrue
+    """
+    supported_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+    ext = Path(file_path).suffix.lower()
+    return ext in supported_extensions
+
+
+# =============================================================================
+# Phase 3-2: メディアアップロード
+# =============================================================================
+
+def upload_image(
+    config: dict,
+    image_path: str,
+    alt_text: str = ''
+) -> Optional[Dict[str, Any]]:
+    """
+    画像をWordPressメディアライブラリにアップロードする。
+    
+    Args:
+        config: 設定辞書（WP_URL, WP_USER, WP_APP_PASSWORD）
+        image_path: アップロードする画像のローカルパス
+        alt_text: 画像のalt属性テキスト
+    
+    Returns:
+        Optional[Dict[str, Any]]: アップロード成功時は {'id': メディアID, 'url': URL}
+                                  失敗時は None
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/media"
+    
+    # ファイル存在チェック
+    path = Path(image_path)
+    if not path.exists():
+        logger.error(f"画像ファイルが見つかりません: {image_path}")
+        return None
+    
+    # サポート形式チェック
+    if not is_supported_image_format(image_path):
+        logger.warning(f"サポートされていない画像形式です: {path.suffix}")
+        logger.warning("対応形式: JPEG, PNG, GIF, WebP")
+        return None
+    
+    # MIMEタイプを取得
+    mime_type = get_mime_type(image_path)
+    
+    logger.debug(f"画像アップロード開始: {path.name} (MIME: {mime_type})")
+    
+    try:
+        with open(image_path, 'rb') as f:
+            file_data = f.read()
+        
+        # ファイル名（日本語対応）
+        file_name = path.name
+        
+        # リクエストヘッダー
+        headers = {
+            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Type': mime_type,
+        }
+        
+        response = requests.post(
+            endpoint,
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            headers=headers,
+            data=file_data,
+            timeout=60  # 画像アップロードは時間がかかる可能性があるため長めに設定
+        )
+        
+        if response.status_code == 201:
+            result = response.json()
+            media_id = result.get('id')
+            media_url = result.get('source_url')
+            
+            logger.info(f"画像アップロード成功: {path.name} (ID: {media_id})")
+            logger.debug(f"  URL: {media_url}")
+            
+            # alt属性を設定（別途APIコールが必要）
+            if alt_text:
+                update_media_alt(config, media_id, alt_text)
+            
+            return {
+                'id': media_id,
+                'url': media_url,
+                'filename': file_name
+            }
+        else:
+            logger.error(f"画像アップロード失敗 [{response.status_code}]: {path.name}")
+            try:
+                error_data = response.json()
+                if 'message' in error_data:
+                    logger.error(f"  エラー: {error_data['message']}")
+            except Exception:
+                logger.error(f"  レスポンス: {response.text[:200]}")
+            return None
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"画像アップロードがタイムアウトしました: {path.name}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"画像アップロード中にエラーが発生: {e}")
+        return None
+    except IOError as e:
+        logger.error(f"画像ファイルの読み込みに失敗: {e}")
+        return None
+
+
+def update_media_alt(config: dict, media_id: int, alt_text: str) -> bool:
+    """
+    メディアのalt属性を更新する。
+    
+    Args:
+        config: 設定辞書
+        media_id: メディアID
+        alt_text: 設定するalt属性テキスト
+    
+    Returns:
+        bool: 成功時はTrue
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/media/{media_id}"
+    
+    try:
+        response = requests.post(
+            endpoint,
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            json={'alt_text': alt_text},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            logger.debug(f"alt属性を設定しました (ID: {media_id}): {alt_text}")
+            return True
+        else:
+            logger.debug(f"alt属性の設定に失敗しました (ID: {media_id})")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        logger.debug(f"alt属性更新中にエラー: {e}")
+        return False
+
+
+# =============================================================================
+# Phase 3-3: パス置換
+# =============================================================================
+
+def replace_image_paths(
+    content: str,
+    image_mappings: List[Dict[str, str]]
+) -> str:
+    """
+    コンテンツ内のローカル画像パスをアップロード後のURLに置換する。
+    
+    Args:
+        content: 元のコンテンツ
+        image_mappings: 置換マッピングのリスト
+            各要素は {'original': 元のパス, 'url': 新しいURL} を含む
+    
+    Returns:
+        str: パスを置換したコンテンツ
+    """
+    result = content
+    
+    for mapping in image_mappings:
+        original_path = mapping['original']
+        new_url = mapping['url']
+        
+        # Markdownパターンの置換: ![alt](original_path) -> ![alt](new_url)
+        md_pattern = re.compile(
+            r'(!\[[^\]]*\]\()' + re.escape(original_path) + r'(\s*(?:"[^"]*")?\))',
+            re.IGNORECASE
+        )
+        result = md_pattern.sub(r'\1' + new_url + r'\2', result)
+        
+        # HTMLパターンの置換: src="original_path" -> src="new_url"
+        html_pattern = re.compile(
+            r'(src=["\'])' + re.escape(original_path) + r'(["\'])',
+            re.IGNORECASE
+        )
+        result = html_pattern.sub(r'\1' + new_url + r'\2', result)
+        
+        logger.debug(f"パス置換: {original_path} -> {new_url}")
+    
+    return result
+
+
+def process_images(
+    config: dict,
+    content: str,
+    file_path: str
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    コンテンツ内の画像を検出・アップロード・置換する統合処理。
+    
+    Args:
+        config: 設定辞書
+        content: 元のコンテンツ
+        file_path: コンテンツファイルのパス
+    
+    Returns:
+        Tuple[str, List[Dict]]: (置換後のコンテンツ, アップロードされた画像情報リスト)
+    """
+    # ローカル画像を検出
+    local_images = find_local_images(content, file_path)
+    
+    if not local_images:
+        return content, []
+    
+    logger.info(f"{len(local_images)} 件の画像をアップロードします...")
+    
+    uploaded_images = []
+    image_mappings = []
+    
+    for image in local_images:
+        result = upload_image(
+            config,
+            image['absolute'],
+            image['alt']
+        )
+        
+        if result:
+            uploaded_images.append({
+                'id': result['id'],
+                'url': result['url'],
+                'filename': result['filename'],
+                'original_path': image['original']
+            })
+            image_mappings.append({
+                'original': image['original'],
+                'url': result['url']
+            })
+        else:
+            logger.warning(f"画像のアップロードに失敗しました: {image['original']}")
+    
+    # パスを置換
+    if image_mappings:
+        content = replace_image_paths(content, image_mappings)
+        logger.info(f"{len(image_mappings)} 件の画像パスを置換しました")
+    
+    return content, uploaded_images
+
+
+# =============================================================================
 # Phase 2-4: HTML入力対応
 # =============================================================================
 
@@ -580,7 +978,8 @@ def post_to_wordpress(
     tags: Optional[List[int]] = None,
     slug: Optional[str] = None,
     date: Optional[str] = None,
-    excerpt: Optional[str] = None
+    excerpt: Optional[str] = None,
+    featured_media: Optional[int] = None
 ) -> requests.Response:
     """
     WordPressにコンテンツを投稿する。
@@ -595,6 +994,7 @@ def post_to_wordpress(
         slug: 投稿スラッグ（URLの一部）
         date: 投稿日時（ISO 8601形式）
         excerpt: 抜粋
+        featured_media: アイキャッチ画像のメディアID
     
     Returns:
         requests.Response: APIレスポンス
@@ -631,6 +1031,10 @@ def post_to_wordpress(
     if excerpt:
         post_data['excerpt'] = excerpt
         logger.debug(f"抜粋: {excerpt[:50]}..." if len(excerpt) > 50 else f"抜粋: {excerpt}")
+    
+    if featured_media:
+        post_data['featured_media'] = featured_media
+        logger.debug(f"アイキャッチ画像ID: {featured_media}")
     
     logger.debug(f"投稿先: {endpoint}")
     logger.debug(f"ステータス: {status}")
@@ -856,6 +1260,13 @@ Front Matter対応:
         help='存在しないカテゴリ/タグを自動作成'
     )
     
+    # アイキャッチ画像オプション
+    parser.add_argument(
+        '--no-featured',
+        action='store_true',
+        help='アイキャッチ画像を設定しない（デフォルトは最初の画像をアイキャッチに設定）'
+    )
+    
     # 詳細出力オプション
     parser.add_argument(
         '-v', '--verbose',
@@ -964,6 +1375,50 @@ def main():
     if excerpt:
         logger.info(f"抜粋: {excerpt[:30]}..." if len(str(excerpt)) > 30 else f"抜粋: {excerpt}")
     
+    # 画像処理（Phase 3）
+    uploaded_images = []
+    featured_media_id = None
+    
+    # Markdownの場合は変換前の本文から画像を検出し処理
+    # HTMLの場合はhtml_contentから画像を検出し処理
+    if is_html_file(file_path):
+        # HTMLファイルの場合
+        html_content, uploaded_images = process_images(config, html_content, file_path)
+    else:
+        # Markdownファイルの場合は、変換前の本文から画像を処理
+        body, uploaded_images = process_images(config, body, file_path)
+        # 画像パス置換後に再度HTML変換
+        if uploaded_images:
+            logger.info("画像パス置換後にMarkdown→HTML再変換中...")
+            html_content = convert_markdown_to_html(body)
+            # JSON-LDを再度末尾に移動
+            html_content = move_jsonld_to_end(html_content)
+    
+    # アイキャッチ画像の設定
+    if uploaded_images and not args.no_featured:
+        # Front Matterでfeatured_imageが指定されている場合はそのファイルを使用
+        featured_image_path = metadata.get('featured_image')
+        
+        if featured_image_path:
+            # 指定された画像をアイキャッチとして探す
+            for img in uploaded_images:
+                if featured_image_path in img['original_path'] or featured_image_path == img['filename']:
+                    featured_media_id = img['id']
+                    logger.info(f"アイキャッチ画像を設定 (指定): {img['filename']} (ID: {featured_media_id})")
+                    break
+            
+            if not featured_media_id:
+                logger.warning(f"指定されたアイキャッチ画像が見つかりません: {featured_image_path}")
+                logger.info("最初の画像をアイキャッチとして設定します")
+                featured_media_id = uploaded_images[0]['id']
+                logger.info(f"アイキャッチ画像を設定: {uploaded_images[0]['filename']} (ID: {featured_media_id})")
+        else:
+            # デフォルト: 最初の画像をアイキャッチに設定
+            featured_media_id = uploaded_images[0]['id']
+            logger.info(f"アイキャッチ画像を設定: {uploaded_images[0]['filename']} (ID: {featured_media_id})")
+    elif args.no_featured:
+        logger.info("アイキャッチ画像は設定しません (--no-featured オプション)")
+    
     # WordPressに投稿
     status_label = "公開" if status == 'publish' else "下書き"
     logger.info(f"WordPressに{status_label}として投稿中...")
@@ -976,7 +1431,8 @@ def main():
         tags=tag_ids,
         slug=slug,
         date=str(date) if date else None,
-        excerpt=excerpt
+        excerpt=excerpt,
+        featured_media=featured_media_id
     )
     
     # レスポンス処理

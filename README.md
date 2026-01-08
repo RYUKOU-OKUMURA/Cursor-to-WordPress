@@ -20,6 +20,13 @@ CursorエディタでMarkdownを作成し、WordPressへ自動投稿するCLIツ
 - **JSON-LD対応**: 構造化データを自動的に本文末尾に移動
 - **投稿パラメータ拡張**: slug、date、excerptの指定が可能
 
+### 画像対応（Phase 3）
+- **ローカル画像の自動アップロード**: Markdown/HTML内のローカル画像を自動検出
+- **メディアライブラリへのアップロード**: WordPress REST API経由で画像をアップロード
+- **パス自動置換**: 本文内のローカルパスをアップロード後のURLに自動置換
+- **アイキャッチ画像の自動設定**: 最初の画像を自動的にアイキャッチに設定
+- **対応形式**: JPEG、PNG、GIF、WebP
+
 ## 必要要件
 
 - Python 3.8以上
@@ -90,6 +97,7 @@ python post_to_wp.py --help
 | `--draft` | - | 下書きとして投稿（デフォルト） |
 | `--publish` | - | 公開として投稿 |
 | `--create-terms` | - | 存在しないカテゴリ/タグを自動作成 |
+| `--no-featured` | - | アイキャッチ画像を設定しない |
 | `--verbose` | `-v` | 詳細なログを出力 |
 | `--help` | `-h` | ヘルプを表示 |
 
@@ -153,6 +161,7 @@ excerpt: この記事はMarkdownからWordPressへ投稿する方法を解説し
 | `slug` | 投稿スラッグ（URLの一部） | `slug: my-custom-slug` |
 | `date` | 投稿日時（ISO 8601形式） | `date: 2024-01-15T12:00:00` |
 | `excerpt` | 抜粋文 | `excerpt: 記事の概要` |
+| `featured_image` | アイキャッチ画像のファイル名 | `featured_image: image.png` |
 
 ### タイトルの指定
 
@@ -179,6 +188,46 @@ excerpt: この記事はMarkdownからWordPressへ投稿する方法を解説し
 - コードブロック（バッククォート3つで囲む）
 - テーブル
 - リンク・画像
+
+### 画像の埋め込み
+
+ローカル画像を含む記事を投稿すると、画像は自動的にWordPressメディアライブラリにアップロードされます。
+
+```markdown
+![画像の説明](images/sample.png)
+```
+
+#### 画像の動作
+
+- **ローカル画像**: 相対パスまたは絶対パスで指定された画像は自動アップロード
+- **外部URL**: `http://` や `https://` で始まるURLはそのまま保持
+- **アイキャッチ**: デフォルトで最初の画像がアイキャッチに設定
+- **対応形式**: JPEG, PNG, GIF, WebP
+
+#### アイキャッチ画像の制御
+
+```markdown
+---
+title: 記事タイトル
+featured_image: special-image.png  # 特定の画像をアイキャッチに指定
+---
+```
+
+アイキャッチを設定しない場合は `--no-featured` オプションを使用：
+
+```bash
+python post_to_wp.py article.md --no-featured
+```
+
+#### 画像付き記事の例
+
+```bash
+# 画像付き記事を投稿
+python post_to_wp.py articles/sample_with_images.md
+
+# アイキャッチなしで投稿
+python post_to_wp.py articles/sample_with_images.md --no-featured
+```
 
 ### HTMLファイルの投稿
 
@@ -218,7 +267,10 @@ HTMLファイルの場合：
 ├── README.md          # このファイル
 ├── AGENTS.md          # AI向けプロジェクト説明
 ├── articles/          # Markdown置き場
-│   └── sample_article.md
+│   ├── sample_article.md
+│   ├── sample_with_frontmatter.md
+│   ├── sample_with_images.md
+│   └── images/        # 画像ファイル置き場
 └── docs/              # 設計ドキュメント
     ├── 要件定義書_清書.md
     ├── アーキテクチャ_清書.md
@@ -263,6 +315,13 @@ HTMLファイルの場合：
 - `markdown2`: Markdown→HTML変換
 - `python-dotenv`: 環境変数管理
 - `pyyaml`: Front Matter（YAML）解析
+
+### 画像アップロードの仕組み
+
+1. **検出**: `find_local_images()` がMarkdown/HTML内のローカル画像パスを検出
+2. **アップロード**: `upload_image()` が `/wp-json/wp/v2/media` エンドポイントに画像をPOST
+3. **置換**: `replace_image_paths()` が本文内のパスをアップロード後のURLに置換
+4. **アイキャッチ**: 最初の画像IDを `featured_media` パラメータとして投稿APIに送信
 
 ### テスト実行
 
