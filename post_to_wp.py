@@ -11,10 +11,11 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 
 import markdown2
 import requests
+import yaml
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 
@@ -238,6 +239,335 @@ def convert_markdown_to_html(markdown_content: str) -> str:
 
 
 # =============================================================================
+# Phase 2-1: Front Matter対応
+# =============================================================================
+
+def parse_front_matter(content: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Front Matterを解析して、メタデータと本文を分離する。
+    
+    Args:
+        content: Markdownファイルの内容（Front Matterを含む可能性がある）
+    
+    Returns:
+        Tuple[Dict[str, Any], str]: (メタデータ辞書, Front Matterを除いた本文)
+    """
+    metadata = {}
+    body = content
+    
+    # Front Matterパターン: --- で始まり --- で終わるYAMLブロック
+    front_matter_pattern = re.compile(
+        r'^---\s*\n(.*?)\n---\s*\n',
+        re.DOTALL
+    )
+    
+    match = front_matter_pattern.match(content)
+    if match:
+        yaml_content = match.group(1)
+        try:
+            metadata = yaml.safe_load(yaml_content) or {}
+            body = content[match.end():]
+            logger.debug(f"Front Matter検出: {list(metadata.keys())}")
+        except yaml.YAMLError as e:
+            logger.warning(f"Front Matterの解析に失敗しました: {e}")
+            # 解析失敗時は元のコンテンツをそのまま返す
+            metadata = {}
+            body = content
+    else:
+        logger.debug("Front Matterは検出されませんでした")
+    
+    return metadata, body
+
+
+# =============================================================================
+# Phase 2-2: カテゴリ/タグのID解決
+# =============================================================================
+
+def get_category_id(
+    config: dict,
+    category_name: str,
+    create_if_not_exists: bool = False
+) -> Optional[int]:
+    """
+    カテゴリ名からIDを取得する。
+    
+    Args:
+        config: 設定辞書（WP_URL, WP_USER, WP_APP_PASSWORD）
+        category_name: カテゴリ名
+        create_if_not_exists: 存在しない場合に自動作成するか
+    
+    Returns:
+        Optional[int]: カテゴリID（見つからない場合はNone）
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/categories"
+    
+    try:
+        # 名前で検索
+        response = requests.get(
+            endpoint,
+            params={'search': category_name},
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            categories = response.json()
+            # 完全一致するカテゴリを探す
+            for cat in categories:
+                if cat['name'].lower() == category_name.lower():
+                    logger.debug(f"カテゴリ '{category_name}' のID: {cat['id']}")
+                    return cat['id']
+        
+        # 見つからない場合
+        if create_if_not_exists:
+            return create_category(config, category_name)
+        else:
+            logger.warning(f"カテゴリ '{category_name}' が見つかりませんでした")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"カテゴリ検索中にエラーが発生: {e}")
+        return None
+
+
+def create_category(config: dict, category_name: str) -> Optional[int]:
+    """
+    新しいカテゴリを作成する。
+    
+    Args:
+        config: 設定辞書
+        category_name: 作成するカテゴリ名
+    
+    Returns:
+        Optional[int]: 作成されたカテゴリのID
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/categories"
+    
+    try:
+        response = requests.post(
+            endpoint,
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            json={'name': category_name},
+            timeout=30
+        )
+        
+        if response.status_code == 201:
+            cat_id = response.json()['id']
+            logger.info(f"カテゴリ '{category_name}' を作成しました (ID: {cat_id})")
+            return cat_id
+        else:
+            logger.warning(f"カテゴリ '{category_name}' の作成に失敗しました: {response.status_code}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"カテゴリ作成中にエラーが発生: {e}")
+        return None
+
+
+def get_tag_id(
+    config: dict,
+    tag_name: str,
+    create_if_not_exists: bool = False
+) -> Optional[int]:
+    """
+    タグ名からIDを取得する。
+    
+    Args:
+        config: 設定辞書（WP_URL, WP_USER, WP_APP_PASSWORD）
+        tag_name: タグ名
+        create_if_not_exists: 存在しない場合に自動作成するか
+    
+    Returns:
+        Optional[int]: タグID（見つからない場合はNone）
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/tags"
+    
+    try:
+        # 名前で検索
+        response = requests.get(
+            endpoint,
+            params={'search': tag_name},
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            tags = response.json()
+            # 完全一致するタグを探す
+            for tag in tags:
+                if tag['name'].lower() == tag_name.lower():
+                    logger.debug(f"タグ '{tag_name}' のID: {tag['id']}")
+                    return tag['id']
+        
+        # 見つからない場合
+        if create_if_not_exists:
+            return create_tag(config, tag_name)
+        else:
+            logger.warning(f"タグ '{tag_name}' が見つかりませんでした")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"タグ検索中にエラーが発生: {e}")
+        return None
+
+
+def create_tag(config: dict, tag_name: str) -> Optional[int]:
+    """
+    新しいタグを作成する。
+    
+    Args:
+        config: 設定辞書
+        tag_name: 作成するタグ名
+    
+    Returns:
+        Optional[int]: 作成されたタグのID
+    """
+    endpoint = f"{config['WP_URL']}/wp-json/wp/v2/tags"
+    
+    try:
+        response = requests.post(
+            endpoint,
+            auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
+            json={'name': tag_name},
+            timeout=30
+        )
+        
+        if response.status_code == 201:
+            tag_id = response.json()['id']
+            logger.info(f"タグ '{tag_name}' を作成しました (ID: {tag_id})")
+            return tag_id
+        else:
+            logger.warning(f"タグ '{tag_name}' の作成に失敗しました: {response.status_code}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"タグ作成中にエラーが発生: {e}")
+        return None
+
+
+def resolve_category_ids(
+    config: dict,
+    categories: List[str],
+    create_if_not_exists: bool = False
+) -> List[int]:
+    """
+    カテゴリ名のリストからIDのリストを取得する。
+    
+    Args:
+        config: 設定辞書
+        categories: カテゴリ名のリスト
+        create_if_not_exists: 存在しない場合に自動作成するか
+    
+    Returns:
+        List[int]: カテゴリIDのリスト
+    """
+    category_ids = []
+    for cat_name in categories:
+        cat_id = get_category_id(config, cat_name, create_if_not_exists)
+        if cat_id is not None:
+            category_ids.append(cat_id)
+    return category_ids
+
+
+def resolve_tag_ids(
+    config: dict,
+    tags: List[str],
+    create_if_not_exists: bool = False
+) -> List[int]:
+    """
+    タグ名のリストからIDのリストを取得する。
+    
+    Args:
+        config: 設定辞書
+        tags: タグ名のリスト
+        create_if_not_exists: 存在しない場合に自動作成するか
+    
+    Returns:
+        List[int]: タグIDのリスト
+    """
+    tag_ids = []
+    for tag_name in tags:
+        tag_id = get_tag_id(config, tag_name, create_if_not_exists)
+        if tag_id is not None:
+            tag_ids.append(tag_id)
+    return tag_ids
+
+
+# =============================================================================
+# Phase 2-3: JSON-LD移動
+# =============================================================================
+
+def move_jsonld_to_end(html_content: str) -> str:
+    """
+    HTML内のJSON-LDスクリプトを末尾に移動する。
+    
+    Args:
+        html_content: 元のHTMLコンテンツ
+    
+    Returns:
+        str: JSON-LDを末尾に移動したHTML
+    """
+    # JSON-LDスクリプトを検出するパターン
+    jsonld_pattern = re.compile(
+        r'<script\s+type=["\']application/ld\+json["\']\s*>.*?</script>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    # すべてのJSON-LDスクリプトを抽出
+    jsonld_scripts = jsonld_pattern.findall(html_content)
+    
+    if not jsonld_scripts:
+        logger.debug("JSON-LDスクリプトは検出されませんでした")
+        return html_content
+    
+    # JSON-LDスクリプトを本文から除去
+    cleaned_html = jsonld_pattern.sub('', html_content)
+    
+    # 空行の重複を整理
+    cleaned_html = re.sub(r'\n{3,}', '\n\n', cleaned_html)
+    cleaned_html = cleaned_html.strip()
+    
+    # JSON-LDスクリプトを末尾に追加
+    result = cleaned_html + '\n\n' + '\n'.join(jsonld_scripts)
+    
+    logger.debug(f"{len(jsonld_scripts)}個のJSON-LDスクリプトを末尾に移動しました")
+    
+    return result
+
+
+# =============================================================================
+# Phase 2-4: HTML入力対応
+# =============================================================================
+
+def is_html_file(file_path: str) -> bool:
+    """
+    ファイルがHTMLファイルかどうかを判定する。
+    
+    Args:
+        file_path: ファイルパス
+    
+    Returns:
+        bool: HTMLファイルの場合はTrue
+    """
+    path = Path(file_path)
+    return path.suffix.lower() in ['.html', '.htm']
+
+
+def is_markdown_file(file_path: str) -> bool:
+    """
+    ファイルがMarkdownファイルかどうかを判定する。
+    
+    Args:
+        file_path: ファイルパス
+    
+    Returns:
+        bool: Markdownファイルの場合はTrue
+    """
+    path = Path(file_path)
+    return path.suffix.lower() in ['.md', '.markdown']
+
+
+# =============================================================================
 # Phase 1-7: WordPress投稿
 # =============================================================================
 
@@ -245,7 +575,12 @@ def post_to_wordpress(
     config: dict,
     title: str,
     html_content: str,
-    status: str = 'draft'
+    status: str = 'draft',
+    categories: Optional[List[int]] = None,
+    tags: Optional[List[int]] = None,
+    slug: Optional[str] = None,
+    date: Optional[str] = None,
+    excerpt: Optional[str] = None
 ) -> requests.Response:
     """
     WordPressにコンテンツを投稿する。
@@ -255,6 +590,11 @@ def post_to_wordpress(
         title: 投稿タイトル
         html_content: 投稿本文（HTML）
         status: 投稿ステータス（'draft' または 'publish'）
+        categories: カテゴリIDのリスト
+        tags: タグIDのリスト
+        slug: 投稿スラッグ（URLの一部）
+        date: 投稿日時（ISO 8601形式）
+        excerpt: 抜粋
     
     Returns:
         requests.Response: APIレスポンス
@@ -270,6 +610,27 @@ def post_to_wordpress(
         'content': html_content,
         'status': status,
     }
+    
+    # オプションパラメータを追加
+    if categories:
+        post_data['categories'] = categories
+        logger.debug(f"カテゴリID: {categories}")
+    
+    if tags:
+        post_data['tags'] = tags
+        logger.debug(f"タグID: {tags}")
+    
+    if slug:
+        post_data['slug'] = slug
+        logger.debug(f"スラッグ: {slug}")
+    
+    if date:
+        post_data['date'] = date
+        logger.debug(f"投稿日時: {date}")
+    
+    if excerpt:
+        post_data['excerpt'] = excerpt
+        logger.debug(f"抜粋: {excerpt[:50]}..." if len(excerpt) > 50 else f"抜粋: {excerpt}")
     
     logger.debug(f"投稿先: {endpoint}")
     logger.debug(f"ステータス: {status}")
@@ -433,12 +794,29 @@ def create_argument_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog='post_to_wp',
-        description='MarkdownファイルをWordPressに投稿するCLIツール',
+        description='Markdown/HTMLファイルをWordPressに投稿するCLIツール',
         epilog='''
 使用例:
   python post_to_wp.py articles/sample.md           # 下書きとして投稿
   python post_to_wp.py articles/sample.md --publish # 公開として投稿
   python post_to_wp.py articles/sample.md -v        # 詳細ログ付きで投稿
+  python post_to_wp.py articles/page.html           # HTMLファイルを投稿
+  python post_to_wp.py articles/sample.md --create-terms  # カテゴリ/タグを自動作成
+
+Front Matter対応:
+  Markdownファイルの先頭に以下のYAML形式でメタデータを指定できます:
+    ---
+    title: 記事のタイトル
+    categories:
+      - カテゴリ1
+      - カテゴリ2
+    tags:
+      - タグ1
+      - タグ2
+    slug: custom-slug
+    date: 2024-01-01T12:00:00
+    excerpt: 記事の抜粋文
+    ---
 
 設定:
   .env ファイルに以下の環境変数を設定してください:
@@ -449,11 +827,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    # 位置引数: Markdownファイルパス
+    # 位置引数: ファイルパス（MarkdownまたはHTML）
     parser.add_argument(
-        'markdown_file',
+        'input_file',
         type=str,
-        help='投稿するMarkdownファイルのパス'
+        metavar='markdown_file',
+        help='投稿するMarkdown/HTMLファイルのパス'
     )
     
     # 投稿ステータス（排他的グループ）
@@ -468,6 +847,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         '--publish',
         action='store_true',
         help='公開として投稿'
+    )
+    
+    # カテゴリ/タグの自動作成オプション
+    parser.add_argument(
+        '--create-terms',
+        action='store_true',
+        help='存在しないカテゴリ/タグを自動作成'
     )
     
     # 詳細出力オプション
@@ -500,22 +886,98 @@ def main():
     # 設定を読み込み
     config = load_config()
     
-    # Markdownファイルを読み込み
-    logger.info(f"ファイル読み込み: {args.markdown_file}")
-    content = read_markdown_file(args.markdown_file)
+    # ファイルを読み込み
+    file_path = args.input_file
+    logger.info(f"ファイル読み込み: {file_path}")
+    content = read_markdown_file(file_path)
     
-    # タイトルを抽出
-    title, body = extract_title(content, args.markdown_file)
-    logger.info(f"タイトル: {title}")
+    # Front Matterを解析
+    metadata, body = parse_front_matter(content)
     
-    # Markdown→HTML変換
-    logger.info("Markdown→HTML変換中...")
-    html_content = convert_markdown_to_html(body)
+    # ファイル形式に応じて処理
+    if is_html_file(file_path):
+        logger.info("HTMLファイルとして処理します")
+        # HTMLファイルはタイトル抽出のみ行い、変換はスキップ
+        if 'title' in metadata:
+            title = metadata['title']
+        else:
+            # HTMLファイルからタイトルを抽出（簡易実装）
+            title_match = re.search(r'<title>(.+?)</title>', body, re.IGNORECASE)
+            if title_match:
+                title = title_match.group(1)
+            else:
+                title = Path(file_path).stem
+        html_content = body
+        logger.info(f"タイトル: {title}")
+    else:
+        # Markdownファイルとして処理
+        logger.info("Markdownファイルとして処理します")
+        
+        # Front Matterのタイトルを優先
+        if 'title' in metadata:
+            title = metadata['title']
+            # タイトルが指定されている場合は本文からの抽出はスキップ
+            logger.info(f"タイトル (Front Matter): {title}")
+        else:
+            # 本文からタイトルを抽出
+            title, body = extract_title(body, file_path)
+            logger.info(f"タイトル: {title}")
+        
+        # Markdown→HTML変換
+        logger.info("Markdown→HTML変換中...")
+        html_content = convert_markdown_to_html(body)
+    
+    # JSON-LDを末尾に移動
+    html_content = move_jsonld_to_end(html_content)
+    
+    # カテゴリ/タグのID解決
+    category_ids = None
+    tag_ids = None
+    
+    if 'categories' in metadata and metadata['categories']:
+        categories = metadata['categories']
+        if isinstance(categories, str):
+            categories = [categories]
+        logger.info(f"カテゴリを解決中: {categories}")
+        category_ids = resolve_category_ids(config, categories, args.create_terms)
+        if category_ids:
+            logger.info(f"カテゴリID: {category_ids}")
+    
+    if 'tags' in metadata and metadata['tags']:
+        tags = metadata['tags']
+        if isinstance(tags, str):
+            tags = [tags]
+        logger.info(f"タグを解決中: {tags}")
+        tag_ids = resolve_tag_ids(config, tags, args.create_terms)
+        if tag_ids:
+            logger.info(f"タグID: {tag_ids}")
+    
+    # その他のメタデータ
+    slug = metadata.get('slug')
+    date = metadata.get('date')
+    excerpt = metadata.get('excerpt')
+    
+    if slug:
+        logger.info(f"スラッグ: {slug}")
+    if date:
+        logger.info(f"投稿日時: {date}")
+    if excerpt:
+        logger.info(f"抜粋: {excerpt[:30]}..." if len(str(excerpt)) > 30 else f"抜粋: {excerpt}")
     
     # WordPressに投稿
     status_label = "公開" if status == 'publish' else "下書き"
     logger.info(f"WordPressに{status_label}として投稿中...")
-    response = post_to_wordpress(config, title, html_content, status)
+    response = post_to_wordpress(
+        config,
+        title,
+        html_content,
+        status,
+        categories=category_ids,
+        tags=tag_ids,
+        slug=slug,
+        date=str(date) if date else None,
+        excerpt=excerpt
+    )
     
     # レスポンス処理
     handle_response(response, config)

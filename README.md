@@ -4,12 +4,21 @@ CursorエディタでMarkdownを作成し、WordPressへ自動投稿するCLIツ
 
 ## 機能
 
+### 基本機能
 - Markdownファイルを読み込んでHTMLに変換
+- HTMLファイルをそのまま投稿
 - WordPress REST APIを使用して投稿
 - 下書き/公開の切り替え対応
 - タイトルの自動抽出（H1 → H2 → ファイル名の優先順）
 - 詳細ログ出力（`--verbose`オプション）
 - エラーメッセージの日本語対応
+
+### 追加機能（Phase 2）
+- **Front Matter対応**: YAML形式でメタデータを指定
+- **カテゴリ/タグの自動設定**: 名前からIDを自動解決
+- **カテゴリ/タグの自動作成**: `--create-terms`オプションで存在しない場合に自動作成
+- **JSON-LD対応**: 構造化データを自動的に本文末尾に移動
+- **投稿パラメータ拡張**: slug、date、excerptの指定が可能
 
 ## 必要要件
 
@@ -80,6 +89,7 @@ python post_to_wp.py --help
 |-----------|--------|------|
 | `--draft` | - | 下書きとして投稿（デフォルト） |
 | `--publish` | - | 公開として投稿 |
+| `--create-terms` | - | 存在しないカテゴリ/タグを自動作成 |
 | `--verbose` | `-v` | 詳細なログを出力 |
 | `--help` | `-h` | ヘルプを表示 |
 
@@ -111,13 +121,47 @@ WordPressに下書きとして投稿中...
 
 ## Markdownの書き方
 
+### Front Matter（YAML形式）
+
+ファイルの先頭にYAML形式でメタデータを指定できます。
+
+```markdown
+---
+title: 記事のタイトル
+categories:
+  - プログラミング
+  - Python
+tags:
+  - CLI
+  - WordPress
+  - 自動化
+slug: custom-post-slug
+date: 2024-01-15T12:00:00
+excerpt: この記事はMarkdownからWordPressへ投稿する方法を解説します。
+---
+
+ここから本文が始まります。
+```
+
+#### Front Matterで指定可能な項目
+
+| 項目 | 説明 | 例 |
+|------|------|-----|
+| `title` | 記事タイトル | `title: 記事のタイトル` |
+| `categories` | カテゴリ（リスト形式） | `categories: [カテゴリ1, カテゴリ2]` |
+| `tags` | タグ（リスト形式） | `tags: [タグ1, タグ2]` |
+| `slug` | 投稿スラッグ（URLの一部） | `slug: my-custom-slug` |
+| `date` | 投稿日時（ISO 8601形式） | `date: 2024-01-15T12:00:00` |
+| `excerpt` | 抜粋文 | `excerpt: 記事の概要` |
+
 ### タイトルの指定
 
 タイトルは以下の優先順で抽出されます：
 
-1. H1見出し（`# タイトル`）
-2. H2見出し（`## タイトル`）
-3. ファイル名
+1. Front Matterの`title`
+2. H1見出し（`# タイトル`）
+3. H2見出し（`## タイトル`）
+4. ファイル名
 
 ```markdown
 # 記事のタイトル
@@ -135,6 +179,33 @@ WordPressに下書きとして投稿中...
 - コードブロック（バッククォート3つで囲む）
 - テーブル
 - リンク・画像
+
+### HTMLファイルの投稿
+
+`.html`または`.htm`ファイルを直接投稿することもできます。
+
+```bash
+python post_to_wp.py articles/page.html --publish
+```
+
+HTMLファイルの場合：
+- Markdown→HTML変換はスキップされます
+- タイトルは`<title>`タグまたはファイル名から抽出されます
+- Front Matterも利用可能です
+
+### JSON-LD（構造化データ）
+
+本文中にJSON-LDスクリプトが含まれている場合、自動的に本文末尾に移動されます。
+
+```html
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "記事のタイトル"
+}
+</script>
+```
 
 ## ディレクトリ構成
 
@@ -191,6 +262,7 @@ WordPressに下書きとして投稿中...
 - `requests`: HTTP通信
 - `markdown2`: Markdown→HTML変換
 - `python-dotenv`: 環境変数管理
+- `pyyaml`: Front Matter（YAML）解析
 
 ### テスト実行
 
