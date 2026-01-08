@@ -8,6 +8,8 @@ CursorエディタでMarkdownを作成し、WordPressへ自動投稿するCLIツ
 - WordPress REST APIを使用して投稿
 - 下書き/公開の切り替え対応
 - タイトルの自動抽出（H1 → H2 → ファイル名の優先順）
+- 詳細ログ出力（`--verbose`オプション）
+- エラーメッセージの日本語対応
 
 ## 必要要件
 
@@ -19,8 +21,8 @@ CursorエディタでMarkdownを作成し、WordPressへ自動投稿するCLIツ
 
 ```bash
 # リポジトリをクローン
-git clone <repository-url>
-cd <repository-name>
+git clone https://github.com/RYUKOU-OKUMURA/Cursor-to-WordPress.git
+cd Cursor-to-WordPress
 
 # 仮想環境を作成（推奨）
 python -m venv venv
@@ -65,14 +67,46 @@ python post_to_wp.py path/to/article.md
 # 公開投稿
 python post_to_wp.py path/to/article.md --publish
 
+# 詳細ログを表示
+python post_to_wp.py path/to/article.md --verbose
+
 # ヘルプを表示
 python post_to_wp.py --help
 ```
+
+### コマンドラインオプション
+
+| オプション | 短縮形 | 説明 |
+|-----------|--------|------|
+| `--draft` | - | 下書きとして投稿（デフォルト） |
+| `--publish` | - | 公開として投稿 |
+| `--verbose` | `-v` | 詳細なログを出力 |
+| `--help` | `-h` | ヘルプを表示 |
 
 ### サンプル記事で試す
 
 ```bash
 python post_to_wp.py articles/sample_article.md
+```
+
+### 出力例
+
+投稿成功時:
+
+```
+Cursor → WordPress 自動投稿ツール
+----------------------------------------
+ファイル読み込み: articles/sample_article.md
+タイトル: サンプル記事
+Markdown→HTML変換中...
+WordPressに下書きとして投稿中...
+==================================================
+投稿が完了しました！
+==================================================
+投稿ID: 123
+ステータス: draft
+編集URL: https://your-site.com/wp-admin/post.php?post=123&action=edit
+プレビューURL: https://your-site.com/?p=123
 ```
 
 ## Markdownの書き方
@@ -93,6 +127,15 @@ python post_to_wp.py articles/sample_article.md
 
 **注意**: タイトルとして抽出された見出しは本文から除去されます。
 
+### 対応するMarkdown記法
+
+- 見出し（`#`, `##`, `###` など）
+- 強調（`**太字**`, `*斜体*`）
+- リスト（番号なし・番号付き）
+- コードブロック（バッククォート3つで囲む）
+- テーブル
+- リンク・画像
+
 ## ディレクトリ構成
 
 ```
@@ -101,9 +144,15 @@ python post_to_wp.py articles/sample_article.md
 ├── .env               # 環境変数（Git管理外）
 ├── .env.example       # 環境変数テンプレート
 ├── .gitignore
+├── README.md          # このファイル
+├── AGENTS.md          # AI向けプロジェクト説明
 ├── articles/          # Markdown置き場
 │   └── sample_article.md
 └── docs/              # 設計ドキュメント
+    ├── 要件定義書_清書.md
+    ├── アーキテクチャ_清書.md
+    ├── 技術スタック_清書.md
+    └── 実装計画書_清書.md
 ```
 
 ## トラブルシューティング
@@ -129,6 +178,26 @@ python post_to_wp.py articles/sample_article.md
 - サイトのURLが正しいか確認
 - サイトがHTTPSに対応しているか確認
 - ファイアウォールやプロキシの設定を確認
+
+### 文字化けする場合
+
+- Markdownファイルがの文字コードがUTF-8か確認
+- BOMなしUTF-8で保存する
+
+## 開発
+
+### 依存パッケージ
+
+- `requests`: HTTP通信
+- `markdown2`: Markdown→HTML変換
+- `python-dotenv`: 環境変数管理
+
+### テスト実行
+
+```bash
+# 詳細ログ付きでテスト
+python post_to_wp.py articles/sample_article.md -v
+```
 
 ## ライセンス
 
