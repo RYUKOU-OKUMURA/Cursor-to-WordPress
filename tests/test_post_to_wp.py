@@ -24,6 +24,13 @@ from post_to_wp import (
     is_markdown_file,
     normalize_date_for_wp,
     remove_heading_matching_title,
+    get_category_id,
+    get_tag_id,
+    resolve_category_ids,
+    resolve_tag_ids,
+    find_local_images,
+    find_existing_media,
+    is_supported_image_format,
 )
 
 
@@ -388,6 +395,289 @@ class TestFileTypeDetection(unittest.TestCase):
         
         self.assertFalse(is_markdown_file("test.html"))
         self.assertFalse(is_markdown_file("test.txt"))
+
+
+class TestMoveJsonldToEndExtended(unittest.TestCase):
+    """move_jsonld_to_end() 関数の拡張テスト（修正1の検証）"""
+
+    def test_jsonld_with_id_attribute(self):
+        """type属性が先頭でないJSON-LDを検出"""
+        html = """<p>本文</p>
+<script id="schema" type="application/ld+json">
+{"@context": "https://schema.org"}
+</script>
+<p>続き</p>"""
+
+        result = move_jsonld_to_end(html)
+
+        self.assertTrue(result.strip().endswith('</script>'))
+        self.assertIn('<p>本文</p>', result)
+        self.assertIn('<p>続き</p>', result)
+
+    def test_jsonld_with_multiple_attributes(self):
+        """複数属性を持つscriptタグのJSON-LD"""
+        html = """<script id="ld" class="structured-data" type="application/ld+json">
+{"@type": "Article"}
+</script>
+<p>本文</p>"""
+
+        result = move_jsonld_to_end(html)
+
+        self.assertTrue(result.strip().endswith('</script>'))
+        self.assertIn('<p>本文</p>', result)
+
+    def test_jsonld_with_data_attribute(self):
+        """data-*属性を持つJSON-LD"""
+        html = """<p>本文</p>
+<script data-schema="main" type="application/ld+json">
+{"@type": "WebPage"}
+</script>"""
+
+        result = move_jsonld_to_end(html)
+
+        self.assertTrue(result.strip().endswith('</script>'))
+
+
+class TestParseFrontMatterExtended(unittest.TestCase):
+    """parse_front_matter() 関数の拡張テスト（修正3の検証）"""
+
+    def test_parse_front_matter_with_bom(self):
+        """BOM付きファイルのFront Matterを解析"""
+        content = "\ufeff---\ntitle: テスト\n---\n\n本文"
+        metadata, body = parse_front_matter(content)
+
+        self.assertEqual(metadata['title'], 'テスト')
+        self.assertIn('本文', body)
+
+    def test_parse_front_matter_with_leading_newline(self):
+        """先頭空行があるFront Matterを解析"""
+        content = "\n\n---\ntitle: テスト\n---\n\n本文"
+        metadata, body = parse_front_matter(content)
+
+        self.assertEqual(metadata['title'], 'テスト')
+        self.assertIn('本文', body)
+
+    def test_parse_front_matter_with_leading_spaces(self):
+        """先頭スペースがあるFront Matterを解析"""
+        content = "   ---\ntitle: テスト\n---\n\n本文"
+        metadata, body = parse_front_matter(content)
+
+        self.assertEqual(metadata['title'], 'テスト')
+        self.assertIn('本文', body)
+
+
+class TestCategoryResolution(unittest.TestCase):
+    """カテゴリID解決のテスト"""
+
+    @patch('post_to_wp.requests.get')
+    def test_get_category_id_found(self, mock_get):
+        """既存カテゴリのIDを取得"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {'id': 5, 'name': 'テストカテゴリ', 'slug': 'test-category'}
+        ]
+        mock_get.return_value = mock_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = get_category_id(config, 'テストカテゴリ')
+
+        self.assertEqual(result, 5)
+
+    @patch('post_to_wp.requests.get')
+    def test_get_category_id_not_found(self, mock_get):
+        """存在しないカテゴリの場合はNone"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_get.return_value = mock_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = get_category_id(config, '存在しないカテゴリ')
+
+        self.assertIsNone(result)
+
+    @patch('post_to_wp.requests.get')
+    @patch('post_to_wp.requests.post')
+    def test_get_category_id_create_if_not_exists(self, mock_post, mock_get):
+        """存在しないカテゴリを自動作成"""
+        # GET: カテゴリが見つからない
+        mock_get_response = MagicMock()
+        mock_get_response.status_code = 200
+        mock_get_response.json.return_value = []
+        mock_get.return_value = mock_get_response
+
+        # POST: カテゴリを作成
+        mock_post_response = MagicMock()
+        mock_post_response.status_code = 201
+        mock_post_response.json.return_value = {'id': 10}
+        mock_post.return_value = mock_post_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = get_category_id(config, '新カテゴリ', create_if_not_exists=True)
+
+        self.assertEqual(result, 10)
+
+    @patch('post_to_wp.get_category_id')
+    def test_resolve_category_ids(self, mock_get_category_id):
+        """複数カテゴリのID解決"""
+        mock_get_category_id.side_effect = [1, 2, None]  # 3番目は見つからない
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = resolve_category_ids(config, ['カテゴリ1', 'カテゴリ2', 'カテゴリ3'])
+
+        self.assertEqual(result, [1, 2])
+
+
+class TestTagResolution(unittest.TestCase):
+    """タグID解決のテスト"""
+
+    @patch('post_to_wp.requests.get')
+    def test_get_tag_id_found(self, mock_get):
+        """既存タグのIDを取得"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {'id': 15, 'name': 'テストタグ', 'slug': 'test-tag'}
+        ]
+        mock_get.return_value = mock_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = get_tag_id(config, 'テストタグ')
+
+        self.assertEqual(result, 15)
+
+    @patch('post_to_wp.get_tag_id')
+    def test_resolve_tag_ids(self, mock_get_tag_id):
+        """複数タグのID解決"""
+        mock_get_tag_id.side_effect = [10, 20]
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = resolve_tag_ids(config, ['タグ1', 'タグ2'])
+
+        self.assertEqual(result, [10, 20])
+
+
+class TestImageProcessing(unittest.TestCase):
+    """画像処理のテスト"""
+
+    def test_find_local_images_markdown(self):
+        """Markdownからローカル画像を検出（実ファイル使用）"""
+        # 一時ディレクトリを作成して画像ファイルも作成
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # テスト用画像ファイルを作成
+            images_dir = Path(tmpdir) / 'images'
+            images_dir.mkdir()
+            (images_dir / 'test.png').write_bytes(b'PNG fake content')
+
+            md_file = Path(tmpdir) / 'article.md'
+            content = """
+本文です。
+![代替テキスト](./images/test.png)
+![外部画像](https://example.com/image.png)
+"""
+            md_file.write_text(content)
+
+            images = find_local_images(content, str(md_file))
+            # 外部URLは除外され、存在するローカル画像のみ検出される
+            local_paths = [img['original'] for img in images]
+            self.assertEqual(len(local_paths), 1)
+            self.assertTrue(any('test.png' in p for p in local_paths))
+
+    def test_find_local_images_html(self):
+        """HTMLからローカル画像を検出（実ファイル使用）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # テスト用画像ファイルを作成
+            images_dir = Path(tmpdir) / 'images'
+            images_dir.mkdir()
+            (images_dir / 'test.png').write_bytes(b'PNG fake content')
+
+            html_file = Path(tmpdir) / 'article.html'
+            content = """
+<p>本文</p>
+<img src="./images/test.png" alt="テスト">
+<img src="https://example.com/image.png">
+"""
+            html_file.write_text(content)
+
+            images = find_local_images(content, str(html_file))
+            local_paths = [img['original'] for img in images]
+            self.assertEqual(len(local_paths), 1)
+            self.assertTrue(any('test.png' in p for p in local_paths))
+
+    def test_is_supported_image_format(self):
+        """サポートされている画像形式の判定"""
+        self.assertTrue(is_supported_image_format('test.jpg'))
+        self.assertTrue(is_supported_image_format('test.jpeg'))
+        self.assertTrue(is_supported_image_format('test.png'))
+        self.assertTrue(is_supported_image_format('test.gif'))
+        self.assertTrue(is_supported_image_format('test.webp'))
+        self.assertTrue(is_supported_image_format('test.PNG'))  # 大文字
+
+        self.assertFalse(is_supported_image_format('test.svg'))
+        self.assertFalse(is_supported_image_format('test.bmp'))
+        self.assertFalse(is_supported_image_format('test.pdf'))
+
+    @patch('post_to_wp.requests.get')
+    def test_find_existing_media_found(self, mock_get):
+        """既存メディアの検索（見つかった場合）"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {
+                'id': 100,
+                'source_url': 'https://example.com/wp-content/uploads/2024/01/test.png',
+                'media_details': {'file': '2024/01/test.png', 'filesize': 12345}
+            }
+        ]
+        mock_get.return_value = mock_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = find_existing_media(config, 'test.png')
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['id'], 100)
+
+    @patch('post_to_wp.requests.get')
+    def test_find_existing_media_not_found(self, mock_get):
+        """既存メディアの検索（見つからない場合）"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_get.return_value = mock_response
+
+        config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+        result = find_existing_media(config, 'nonexistent.png')
+
+        self.assertIsNone(result)
+
+    @patch('post_to_wp.requests.get')
+    def test_find_existing_media_size_mismatch(self, mock_get):
+        """ファイルサイズ不一致時は既存メディアを使用しない"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {
+                'id': 100,
+                'source_url': 'https://example.com/wp-content/uploads/test.png',
+                'media_details': {'file': 'test.png', 'filesize': 99999}  # 異なるサイズ
+            }
+        ]
+        mock_get.return_value = mock_response
+
+        # 一時ファイルを作成（サイズが異なる）
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            f.write(b'small content')  # 13 bytes
+            temp_path = f.name
+
+        try:
+            config = {'WP_URL': 'https://example.com', 'WP_USER': 'user', 'WP_APP_PASSWORD': 'pass'}
+            result = find_existing_media(config, 'test.png', temp_path)
+
+            # サイズ不一致のため None が返される
+            self.assertIsNone(result)
+        finally:
+            os.unlink(temp_path)
 
 
 if __name__ == '__main__':

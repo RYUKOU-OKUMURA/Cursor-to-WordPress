@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import sys
+import traceback
 from datetime import datetime, date
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
@@ -260,19 +261,29 @@ def parse_front_matter(content: str) -> Tuple[Dict[str, Any], str]:
     """
     metadata = {}
     body = content
-    
+
+    # BOMを除去（UTF-8 BOM: \ufeff）
+    if content.startswith('\ufeff'):
+        content = content[1:]
+        body = content
+        logger.debug("BOMを除去しました")
+
+    # 先頭の空白文字を除去してからパターンマッチ
+    stripped_content = content.lstrip()
+
     # Front Matterパターン: --- で始まり --- で終わるYAMLブロック
     front_matter_pattern = re.compile(
         r'^---\s*\n(.*?)\n---\s*\n',
         re.DOTALL
     )
-    
-    match = front_matter_pattern.match(content)
+
+    match = front_matter_pattern.match(stripped_content)
     if match:
         yaml_content = match.group(1)
         try:
             metadata = yaml.safe_load(yaml_content) or {}
-            body = content[match.end():]
+            # 除去後のコンテンツから本文を取得
+            body = stripped_content[match.end():]
             logger.debug(f"Front Matter検出: {list(metadata.keys())}")
         except yaml.YAMLError as e:
             logger.warning(f"Front Matterの解析に失敗しました: {e}")
@@ -281,7 +292,7 @@ def parse_front_matter(content: str) -> Tuple[Dict[str, Any], str]:
             body = content
     else:
         logger.debug("Front Matterは検出されませんでした")
-    
+
     return metadata, body
 
 
@@ -571,8 +582,9 @@ def move_jsonld_to_end(html_content: str) -> str:
         str: JSON-LDを末尾に移動したHTML
     """
     # JSON-LDスクリプトを検出するパターン
+    # type属性がどの位置にあっても検出できるよう柔軟なパターンを使用
     jsonld_pattern = re.compile(
-        r'<script\s+type=["\']application/ld\+json["\']\s*>.*?</script>',
+        r'<script\s+[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>',
         re.DOTALL | re.IGNORECASE
     )
     
@@ -760,20 +772,31 @@ def is_supported_image_format(file_path: str) -> bool:
 
 def find_existing_media(
     config: dict,
-    file_name: str
+    file_name: str,
+    local_file_path: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     既存のメディアから同名ファイルを検索する。
-    
+    ローカルファイルパスが指定された場合はファイルサイズも比較する。
+
     Args:
         config: 設定辞書
         file_name: 画像ファイル名
-    
+        local_file_path: ローカルファイルのパス（サイズ比較用）
+
     Returns:
         Optional[Dict[str, Any]]: 見つかった場合は {'id': ID, 'url': URL, 'filename': file_name}
     """
     endpoint = f"{config['WP_URL']}/wp-json/wp/v2/media"
-    
+
+    # ローカルファイルのサイズを取得
+    local_file_size = None
+    if local_file_path:
+        local_path = Path(local_file_path)
+        if local_path.exists():
+            local_file_size = local_path.stat().st_size
+            logger.debug(f"ローカルファイルサイズ: {local_file_size} bytes")
+
     try:
         response = requests.get(
             endpoint,
@@ -781,26 +804,38 @@ def find_existing_media(
             auth=HTTPBasicAuth(config['WP_USER'], config['WP_APP_PASSWORD']),
             timeout=30
         )
-        
+
         if response.status_code != 200:
             logger.debug(f"メディア検索失敗 [{response.status_code}]")
             return None
-        
+
         file_name_lower = file_name.lower()
-        
+
         for item in response.json():
             source_url = item.get('source_url') or ''
             media_file = (item.get('media_details') or {}).get('file') or ''
-            
+
             if source_url.lower().endswith(file_name_lower) or media_file.lower().endswith(file_name_lower):
+                # ファイルサイズの比較（ローカルファイルパスが指定されている場合）
+                if local_file_size is not None:
+                    media_details = item.get('media_details') or {}
+                    remote_file_size = media_details.get('filesize')
+
+                    if remote_file_size and remote_file_size != local_file_size:
+                        logger.debug(
+                            f"ファイルサイズ不一致: ローカル={local_file_size}, "
+                            f"リモート={remote_file_size} - スキップして次を検索"
+                        )
+                        continue  # サイズが異なる場合は次のメディアをチェック
+
                 return {
                     'id': item.get('id'),
                     'url': source_url,
                     'filename': file_name
                 }
-        
+
         return None
-        
+
     except requests.exceptions.RequestException as e:
         logger.debug(f"メディア検索中にエラー: {e}")
         return None
@@ -850,8 +885,8 @@ def upload_image(
         # ファイル名（日本語対応）
         file_name = path.name
         
-        # 既存メディアの重複チェック
-        existing = find_existing_media(config, file_name)
+        # 既存メディアの重複チェック（ファイルサイズも比較）
+        existing = find_existing_media(config, file_name, image_path)
         if existing:
             logger.info(f"既存画像を再利用: {file_name} (ID: {existing['id']})")
             return existing
@@ -1164,18 +1199,21 @@ def post_to_wordpress(
     except requests.exceptions.Timeout:
         logger.error("接続がタイムアウトしました（30秒）")
         logger.error("ネットワーク接続を確認してください。")
+        logger.debug(traceback.format_exc())
         sys.exit(1)
-    
+
     except requests.exceptions.ConnectionError as e:
         logger.error(f"接続エラーが発生しました: {e}")
         logger.error("以下を確認してください:")
         logger.error("  - WP_URL が正しいか")
         logger.error("  - サイトが稼働しているか")
         logger.error("  - ネットワーク接続が有効か")
+        logger.debug(traceback.format_exc())
         sys.exit(1)
-    
+
     except requests.exceptions.RequestException as e:
         logger.error(f"リクエストエラーが発生しました: {e}")
+        logger.debug(traceback.format_exc())
         sys.exit(1)
 
 
